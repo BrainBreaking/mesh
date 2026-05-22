@@ -1,14 +1,92 @@
 [project]
-name    = "steer-runtime"
+name    = "rick-workspace"
 version = "1.0.0"
+
+# ── Compile targets ────────────────────────────────────────────────────────────
+
+[targets.kiro]
+output_dir = ".kiro/steering"
 
 [targets.ollama]
 model       = "llama3.2:3b"
 temperature = 0.7
 num_ctx     = 8192
 
-[targets.kiro]
-output_dir = ".kiro/steering"
+# ── Backends ───────────────────────────────────────────────────────────────────
+# Usage: mesh chat --backend <id>
+#        mesh prompt "..." --backend <id>
+
+# ── Local Ollama (Mac Studio) ──────────────────────────────────────────────────
+
+[[backend]]
+id       = "local"
+type     = "ollama"
+model    = "llama3.2:3b"         # fast 3B — quick questions
+base_url = "http://localhost:11434"
+
+[[backend]]
+id       = "local-8b"
+type     = "ollama"
+model    = "llama3.1:8b"         # smarter, still local
+base_url = "http://localhost:11434"
+
+[[backend]]
+id       = "local-deepseek"
+type     = "ollama"
+model    = "deepseek-r1:latest"  # reasoning model, local
+base_url = "http://localhost:11434"
+
+# ── AR8 via Tailscale (100.81.145.19) ─────────────────────────────────────────
+
+[[backend]]
+id       = "ar8"
+type     = "ollama"
+model    = "gemma4:latest"       # 8B Gemma — general purpose
+base_url = "http://100.81.145.19:11434"
+
+[[backend]]
+id       = "ar8-coder"
+type     = "ollama"
+model    = "qwen2.5-coder:14b"   # 14B coding specialist — best for code tasks
+base_url = "http://100.81.145.19:11434"
+
+[[backend]]
+id       = "ar8-qwen"
+type     = "ollama"
+model    = "qwen2.5:7b"          # 7B general, fast on AR8
+base_url = "http://100.81.145.19:11434"
+
+# ── Cloud — OpenAI ─────────────────────────────────────────────────────────────
+
+[[backend]]
+id       = "openai"
+type     = "openai"
+model    = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+api_key  = "${OPENAI_API_KEY}"
+
+[[backend]]
+id       = "codex"
+type     = "openai"
+model    = "o4-mini"             # OpenAI reasoning model
+base_url = "https://api.openai.com/v1"
+api_key  = "${OPENAI_API_KEY}"
+
+# ── Cloud — Anthropic / Claude ─────────────────────────────────────────────────
+
+[[backend]]
+id       = "claude"
+type     = "anthropic"
+model    = "claude-opus-4-7"     # most capable
+api_key  = "${ANTHROPIC_API_KEY}"
+
+[[backend]]
+id       = "claude-fast"
+type     = "anthropic"
+model    = "claude-haiku-4-5"    # fastest + cheapest Claude
+api_key  = "${ANTHROPIC_API_KEY}"
+
+# ── Rules ──────────────────────────────────────────────────────────────────────
 
 [[rule]]
 id           = "golden-rules"
@@ -17,13 +95,29 @@ always_apply = true
 content = """
 # Golden Rules
 
-1. Backward Compatibility — all API changes must be additive.
+1. Backward Compatibility — all API changes must be additive. Never remove or change existing fields.
 2. Test Coverage >= 90% — unit tests for methods, integration tests for endpoints.
-3. No Secrets in Code — use environment variables or secret management.
-4. Structured Logging — include correlation IDs and appropriate log levels.
+3. No Secrets in Code — use environment variables or secret management services.
+4. Structured Logging — include correlation IDs and appropriate log levels (DEBUG, INFO, WARN, ERROR).
 5. Minimal Diff — one story = one PR. Don't refactor unrelated code.
-6. Input Validation — validate all user inputs, never trust client data.
-7. Error Handling — return structured error responses, never expose internals.
+6. Input Validation — validate all user inputs. Never trust client data.
+7. Error Handling — return structured error responses. Never expose internal errors.
+"""
+
+[[rule]]
+id           = "commit-style"
+description  = "Conventional commits format"
+always_apply = true
+content = """
+# Commit Style
+
+Use conventional commits: type(scope): description
+
+Types: feat, fix, docs, style, refactor, test, chore
+Examples:
+  feat(compiler): add anthropic backend support
+  fix(chat): handle empty stream response
+  chore: update dependencies
 """
 
 [[rule]]
@@ -38,21 +132,19 @@ content = """
 - Write table-driven tests with t.Run subtests.
 - Keep functions small and focused (< 40 lines as a guide).
 - Use context.Context as the first parameter for any I/O function.
-- Prefer explicit over implicit — name return values only when it aids clarity.
+- Prefer explicit over implicit.
 """
 
 [[rule]]
-id          = "commit-style"
-description = "Conventional commits format"
-always_apply = true
+id          = "typescript-style"
+description = "TypeScript / Node.js coding conventions"
+globs       = ["**/*.ts", "**/*.tsx"]
 content = """
-# Commit Style
+# TypeScript Style
 
-Use conventional commits: type(scope): description
-
-Types: feat, fix, docs, style, refactor, test, chore
-Examples:
-  feat(compiler): add kiro target support
-  fix(parser): handle empty rule content
-  docs: update README with compile examples
+- Use strict TypeScript — no any, prefer explicit types.
+- Async/await over raw Promises.
+- Handle errors explicitly — no silent catches.
+- Use Zod for runtime validation of external data.
+- Keep components small and focused on a single responsibility.
 """
