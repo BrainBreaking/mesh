@@ -1,0 +1,58 @@
+[project]
+name    = "steer-runtime"
+version = "1.0.0"
+
+[targets.ollama]
+model       = "llama3.2:3b"
+temperature = 0.7
+num_ctx     = 8192
+
+[targets.kiro]
+output_dir = ".kiro/steering"
+
+[[rule]]
+id           = "golden-rules"
+description  = "Core development standards"
+always_apply = true
+content = """
+# Golden Rules
+
+1. Backward Compatibility — all API changes must be additive.
+2. Test Coverage >= 90% — unit tests for methods, integration tests for endpoints.
+3. No Secrets in Code — use environment variables or secret management.
+4. Structured Logging — include correlation IDs and appropriate log levels.
+5. Minimal Diff — one story = one PR. Don't refactor unrelated code.
+6. Input Validation — validate all user inputs, never trust client data.
+7. Error Handling — return structured error responses, never expose internals.
+"""
+
+[[rule]]
+id          = "go-style"
+description = "Go-specific coding conventions"
+globs       = ["**/*.go"]
+content = """
+# Go Style
+
+- Use slog for structured logging with context.
+- Return errors — don't panic in library code.
+- Write table-driven tests with t.Run subtests.
+- Keep functions small and focused (< 40 lines as a guide).
+- Use context.Context as the first parameter for any I/O function.
+- Prefer explicit over implicit — name return values only when it aids clarity.
+"""
+
+[[rule]]
+id          = "commit-style"
+description = "Conventional commits format"
+always_apply = true
+content = """
+# Commit Style
+
+Use conventional commits: type(scope): description
+
+Types: feat, fix, docs, style, refactor, test, chore
+Examples:
+  feat(compiler): add kiro target support
+  fix(parser): handle empty rule content
+  docs: update README with compile examples
+"""

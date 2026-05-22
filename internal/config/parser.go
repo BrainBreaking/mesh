@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/BurntSushi/toml"
 	"github.com/BrainBreaking/mesh/internal/model"
+	"github.com/BurntSushi/toml"
 )
 
 // Load reads and parses a steermesh.toml file into a Manifest.
