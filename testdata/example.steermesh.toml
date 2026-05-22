@@ -10,6 +10,19 @@ num_ctx     = 8192
 [targets.kiro]
 output_dir = ".kiro/steering"
 
+[[backend]]
+id       = "local"
+type     = "ollama"
+model    = "llama3.2:3b"
+base_url = "http://localhost:11434"
+
+[[backend]]
+id       = "cloud"
+type     = "openai"
+model    = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+api_key  = "${OPENAI_API_KEY}"
+
 [[rule]]
 id           = "golden-rules"
 description  = "Core development standards"

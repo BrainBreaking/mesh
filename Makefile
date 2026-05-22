@@ -73,6 +73,23 @@ compile-kiro: build ## Compile manifest → .kiro/steering/
 compile-ollama: build ## Compile manifest → Modelfile
 	./$(BINARY) compile $(MANIFEST) --target ollama
 
+# ── Chat / Prompt / Serve ────────────────────────────────────────────────────
+
+BACKEND    ?=
+MSG        ?= hello
+
+.PHONY: chat
+chat: build ## Start interactive chat: make chat BACKEND=local MANIFEST=steermesh.toml
+	./$(BINARY) chat $(if $(BACKEND),--backend $(BACKEND),) --manifest $(MANIFEST) $(ARGS)
+
+.PHONY: prompt
+prompt: build ## Send a single prompt: make prompt MSG="your message" BACKEND=local
+	./$(BINARY) prompt --manifest $(MANIFEST) $(if $(BACKEND),--backend $(BACKEND),) "$(MSG)"
+
+.PHONY: serve
+serve: build ## Start MCP stdio server: make serve MANIFEST=steermesh.toml
+	./$(BINARY) serve --manifest $(MANIFEST) $(ARGS)
+
 # ── Ollama integration ────────────────────────────────────────────────────────
 
 OLLAMA_MODEL ?= $(shell grep 'name' steermesh.toml 2>/dev/null | head -1 | sed 's/.*= *"\(.*\)"/\1/' || echo "mesh-model")
