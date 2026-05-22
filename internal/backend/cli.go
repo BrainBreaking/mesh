@@ -113,7 +113,8 @@ func (b *CLIBackend) runClaude(
 	args := []string{
 		"-p", prompt,
 		"--output-format", "stream-json",
-		"--verbose", // required for stream-json in --print mode
+		"--verbose",                // required for stream-json in --print mode
+		"--no-session-persistence", // don't write session files for one-shot calls
 	}
 	if system != "" {
 		args = append(args, "--append-system-prompt", system)

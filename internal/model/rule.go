@@ -38,7 +38,7 @@ type Rule struct {
 // Backend holds the configuration for a runtime AI backend.
 type Backend struct {
 	ID      string `toml:"id"`
-	Type    string `toml:"type"`     // "ollama" | "openai"
+	Type    string `toml:"type"`     // "ollama" | "openai" | "anthropic" | "claude-cli" | "codex-cli"
 	Model   string `toml:"model"`
 	BaseURL string `toml:"base_url"` // optional; defaults applied in backend package
 	APIKey  string `toml:"api_key"`  // may contain ${ENV_VAR} references

@@ -17,27 +17,51 @@ import (
 // MCPServer is a minimal Model Context Protocol stdio server (JSON-RPC 2.0).
 type MCPServer struct {
 	manifest *model.Manifest
-	backends map[string]backend.Backend
 
 	mu       sync.Mutex
-	sessions map[string][]backend.Message // session_id → history
+	backends map[string]backend.Backend    // lazily populated on first use
+	sessions map[string][]backend.Message  // session_id → history
 }
 
-// NewMCPServer creates a server from the manifest, instantiating all configured backends.
+// NewMCPServer creates a server from the manifest. Backends are instantiated
+// lazily on first use so that missing API keys don't prevent startup.
 func NewMCPServer(m *model.Manifest) (*MCPServer, error) {
-	backends := make(map[string]backend.Backend, len(m.Backends))
-	for i := range m.Backends {
-		b, err := backend.New(&m.Backends[i])
-		if err != nil {
-			return nil, fmt.Errorf("mcp: backend %q: %w", m.Backends[i].ID, err)
-		}
-		backends[m.Backends[i].ID] = b
-	}
 	return &MCPServer{
 		manifest: m,
-		backends: backends,
+		backends: make(map[string]backend.Backend, len(m.Backends)),
 		sessions: make(map[string][]backend.Message),
 	}, nil
+}
+
+// getBackend returns a cached backend by ID, instantiating it on first call.
+func (s *MCPServer) getBackend(id string) (backend.Backend, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if b, ok := s.backends[id]; ok {
+		return b, nil
+	}
+
+	cfg, ok := s.manifest.BackendByID(id)
+	if !ok {
+		return nil, fmt.Errorf("unknown backend: %s", id)
+	}
+
+	b, err := backend.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	s.backends[id] = b
+	return b, nil
+}
+
+// defaultBackend returns (or lazily creates) the first configured backend.
+func (s *MCPServer) defaultBackend() (backend.Backend, error) {
+	cfg, ok := s.manifest.DefaultBackend()
+	if !ok {
+		return nil, fmt.Errorf("no backends configured in manifest")
+	}
+	return s.getBackend(cfg.ID)
 }
 
 // ── JSON-RPC types ────────────────────────────────────────────────────────────
@@ -92,7 +116,7 @@ func (s *MCPServer) Serve(in io.Reader, out io.Writer) error {
 			respond(req.ID, s.handleInitialize(), nil)
 
 		case "notifications/initialized":
-			// No response needed for notifications.
+			// Notification — no response needed.
 
 		case "tools/list":
 			respond(req.ID, map[string]any{"tools": s.toolList()}, nil)
@@ -100,6 +124,19 @@ func (s *MCPServer) Serve(in io.Reader, out io.Writer) error {
 		case "tools/call":
 			result, rpcErr := s.handleToolCall(req.Params)
 			respond(req.ID, result, rpcErr)
+
+		// MCP clients expect these even when empty.
+		case "resources/list":
+			respond(req.ID, map[string]any{"resources": []any{}}, nil)
+
+		case "resources/read":
+			respond(req.ID, nil, &rpcError{Code: -32602, Message: "no resources available"})
+
+		case "prompts/list":
+			respond(req.ID, map[string]any{"prompts": []any{}}, nil)
+
+		case "prompts/get":
+			respond(req.ID, nil, &rpcError{Code: -32602, Message: "no prompts available"})
 
 		default:
 			respond(req.ID, nil, &rpcError{Code: -32601, Message: fmt.Sprintf("method not found: %s", req.Method)})
@@ -197,25 +234,19 @@ func (s *MCPServer) toolChat(args json.RawMessage, stateful bool) (any, *rpcErro
 	}
 
 	var b backend.Backend
+	var berr error
 	if a.Backend != "" {
-		var ok bool
-		b, ok = s.backends[a.Backend]
-		if !ok {
-			return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("unknown backend: %s", a.Backend)}
-		}
+		b, berr = s.getBackend(a.Backend)
 	} else {
-		// Use first available backend.
-		for _, bk := range s.backends {
-			b = bk
-			break
-		}
-		if b == nil {
-			return nil, &rpcError{Code: -32602, Message: "no backends configured"}
-		}
+		b, berr = s.defaultBackend()
+	}
+	if berr != nil {
+		return nil, &rpcError{Code: -32602, Message: berr.Error()}
 	}
 
 	system := s.manifest.SystemPrompt()
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*60*1e9) // 5-min cap per tool call
+	defer cancel()
 
 	var history []backend.Message
 	if stateful && a.SessionID != "" {
@@ -259,6 +290,6 @@ func (s *MCPServer) toolListBackends() map[string]any {
 
 // Startup prints a startup message to stderr (so it doesn't pollute the MCP channel).
 func (s *MCPServer) Startup() {
-	fmt.Fprintf(os.Stderr, "[mesh] MCP server ready · %d backends · %d rules\n",
-		len(s.backends), len(s.manifest.Rules))
+	fmt.Fprintf(os.Stderr, "[mesh] MCP server ready · %d backends configured · %d rules loaded\n",
+		len(s.manifest.Backends), len(s.manifest.Rules))
 }
