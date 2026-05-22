@@ -186,10 +186,10 @@ var doctorCmd = &cobra.Command{
 			return err
 		}
 
-		results := doctor.Run(m)
-		doctor.Print(os.Stdout, doctorManifest, m, results)
+		// LivePrint uses animated spinner + ANSI colors when stdout is a TTY,
+		// and falls back to plain text output when piped.
+		results := doctor.LivePrint(doctorManifest, m)
 
-		// Exit 1 if any backend failed
 		for _, r := range results {
 			if r.Level == doctor.Fail {
 				os.Exit(1)
