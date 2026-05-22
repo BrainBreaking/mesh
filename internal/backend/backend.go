@@ -31,7 +31,9 @@ func New(cfg *model.Backend) (Backend, error) {
 		return newOpenAIBackend(cfg), nil
 	case "anthropic", "claude":
 		return newAnthropicBackend(cfg)
+	case "claude-cli", "codex-cli":
+		return newCLIBackend(cfg)
 	default:
-		return nil, fmt.Errorf("unknown backend type %q (supported: ollama, openai, anthropic)", cfg.Type)
+		return nil, fmt.Errorf("unknown backend type %q (supported: ollama, openai, anthropic, claude-cli, codex-cli)", cfg.Type)
 	}
 }
