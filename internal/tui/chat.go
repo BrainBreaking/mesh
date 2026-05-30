@@ -60,6 +60,13 @@ type ChatModel struct {
 	entries []entry
 	eventCh chan tea.Msg // receives chunkMsg and streamDone from goroutine
 
+	// message queue — filled when Enter is pressed during streaming;
+	// drained automatically when each response completes.
+	queue []string
+
+	// elapsed timer — set when streaming starts, read on every spinner tick.
+	streamStartedAt time.Time
+
 	// session dependencies
 	sess        *chat.Session
 	backendID   string
@@ -151,26 +158,39 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case tea.KeyEnter:
-			// Don't accept input while streaming.
-			if m.isStreaming() {
-				return m, nil
-			}
 			text := strings.TrimSpace(m.ta.Value())
 			if text == "" {
 				return m, nil
 			}
 			m.ta.Reset()
 
-			// Slash commands are handled locally — not sent to the model.
+			// Slash commands are always handled immediately, never queued.
 			if strings.HasPrefix(text, "/") {
 				response, handled := m.sess.Command(text)
-				msg := response
+				sysMsg := response
 				if !handled {
-					msg = "this backend doesn't support commands — only orchestrators do\ntry: mesh chat --backend brain"
+					sysMsg = "this backend doesn't support commands — only orchestrators do\ntry: mesh chat --backend brain"
 				}
 				m.entries = append(m.entries, entry{
 					role: roleSystem,
-					raw:  msg,
+					raw:  sysMsg,
+					at:   time.Now(),
+				})
+				m.updateViewport()
+				m.vp.GotoBottom()
+				return m, nil
+			}
+
+			// While streaming: queue the message instead of blocking.
+			if m.isStreaming() {
+				m.queue = append(m.queue, text)
+				preview := text
+				if len(preview) > 60 {
+					preview = preview[:57] + "…"
+				}
+				m.entries = append(m.entries, entry{
+					role: roleSystem,
+					raw:  fmt.Sprintf("↑ queued (%d): %q", len(m.queue), preview),
 					at:   time.Now(),
 				})
 				m.updateViewport()
@@ -210,13 +230,20 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.err != nil {
 			m.entries = append(m.entries, entry{
-				role:  roleError,
-				raw:   msg.err.Error(),
-				at:    time.Now(),
+				role: roleError,
+				raw:  msg.err.Error(),
+				at:   time.Now(),
 			})
 		}
 		m.updateViewport()
 		m.vp.GotoBottom()
+
+		// Auto-send the next queued message, if any.
+		if len(m.queue) > 0 {
+			next := m.queue[0]
+			m.queue = m.queue[1:]
+			cmds = append(cmds, m.startSend(next))
+		}
 
 	// ── spinner tick ───────────────────────────────────────────────────────
 	case spinner.TickMsg:
@@ -387,7 +414,8 @@ func (m *ChatModel) renderBubble(e entry, innerW int) string {
 
 	spinStr := ""
 	if e.streaming {
-		spinStr = " " + m.spin.View()
+		elapsed := formatElapsed(time.Since(m.streamStartedAt))
+		spinStr = " " + m.spin.View() + " " + elapsed
 	}
 	tsStr := styleTimestamp.Render(ts + spinStr)
 
@@ -473,6 +501,9 @@ func (m ChatModel) renderStatusBar() string {
 		}
 	}
 	right := fmt.Sprintf("%d turn(s) ", turns)
+	if len(m.queue) > 0 {
+		right = fmt.Sprintf("↑ %d queued  ", len(m.queue)) + right
+	}
 
 	spacerW := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	if spacerW < 0 {
@@ -509,6 +540,8 @@ func (m *ChatModel) startSend(text string) tea.Cmd {
 	})
 	m.updateViewport()
 
+	m.streamStartedAt = time.Now()
+
 	ch := make(chan tea.Msg, 256)
 	m.eventCh = ch
 	sess := m.sess
@@ -530,4 +563,18 @@ func (m *ChatModel) listenForEvent() tea.Cmd {
 	return func() tea.Msg {
 		return <-ch
 	}
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+// formatElapsed formats a duration as a compact human-readable string for the
+// streaming indicator: "0s", "12s", "1m04s", "2m30s", etc.
+func formatElapsed(d time.Duration) string {
+	d = d.Round(time.Second)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	m := int(d.Minutes())
+	s := int(d.Seconds()) % 60
+	return fmt.Sprintf("%dm%02ds", m, s)
 }
