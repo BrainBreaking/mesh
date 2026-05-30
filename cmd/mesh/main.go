@@ -1,12 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -18,6 +16,7 @@ import (
 	"github.com/BrainBreaking/mesh/internal/doctor"
 	"github.com/BrainBreaking/mesh/internal/model"
 	"github.com/BrainBreaking/mesh/internal/server"
+	"github.com/BrainBreaking/mesh/internal/tui"
 )
 
 var rootCmd = &cobra.Command{
@@ -240,58 +239,28 @@ var chatCmd = &cobra.Command{
 	Use:   "chat",
 	Short: "Start an interactive chat session using a configured backend",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		m, b, err := resolveBackend(chatManifest, chatBackendID)
+		manifest, b, err := resolveBackend(chatManifest, chatBackendID)
 		if err != nil {
 			return err
 		}
 
-		// Find the backend config for display purposes.
 		var bcfg *model.Backend
 		if chatBackendID != "" {
-			bcfg, _ = m.BackendByID(chatBackendID)
+			bcfg, _ = manifest.BackendByID(chatBackendID)
 		} else {
-			bcfg, _ = m.DefaultBackend()
+			bcfg, _ = manifest.DefaultBackend()
 		}
 
-		fmt.Printf("[mesh] chatting with %s:%s · %d rules loaded\n",
-			bcfg.Type, bcfg.Model, len(m.Rules))
-		fmt.Println("[mesh] type 'exit' or 'quit' to leave\n")
-
-		system := m.SystemPrompt()
+		system := manifest.SystemPrompt()
 		sess := chat.New(b, system)
 
-		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		defer cancel()
-
-		scanner := bufio.NewScanner(os.Stdin)
-		for {
-			fmt.Print("> ")
-			if !scanner.Scan() {
-				break
-			}
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
-				continue
-			}
-			if line == "exit" || line == "quit" {
-				fmt.Println("[mesh] goodbye")
-				break
-			}
-
-			_, err := sess.Send(ctx, line, func(chunk string) {
-				fmt.Print(chunk)
-			})
-			if err != nil {
-				if ctx.Err() != nil {
-					fmt.Println("\n[mesh] interrupted")
-					return nil
-				}
-				fmt.Fprintf(os.Stderr, "\n[mesh] error: %v\n", err)
-				continue
-			}
-			fmt.Println() // newline after streamed response
-		}
-		return nil
+		return tui.RunChat(
+			sess,
+			bcfg.ID,
+			bcfg.Type,
+			bcfg.Model,
+			len(manifest.Rules),
+		)
 	},
 }
 
