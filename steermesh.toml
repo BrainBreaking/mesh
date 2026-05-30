@@ -19,84 +19,120 @@ num_ctx     = 8192
 # ── Local Ollama (Mac Studio) ──────────────────────────────────────────────────
 
 [[backend]]
-id       = "local"
-type     = "ollama"
-model    = "llama3.2:3b"         # fast 3B — quick questions
-base_url = "http://localhost:11434"
+id           = "local"
+type         = "ollama"
+model        = "llama3.2:3b"         # fast 3B — quick questions
+base_url     = "http://localhost:11434"
+capabilities = ["quick", "simple", "lookup", "trivia", "chat"]
 
 [[backend]]
-id       = "local-8b"
-type     = "ollama"
-model    = "llama3.1:8b"         # smarter, still local
-base_url = "http://localhost:11434"
+id           = "local-8b"
+type         = "ollama"
+model        = "llama3.1:8b"         # smarter, still local
+base_url     = "http://localhost:11434"
+capabilities = ["general", "writing", "analysis", "explanation", "summary"]
 
 [[backend]]
-id       = "local-deepseek"
-type     = "ollama"
-model    = "deepseek-r1:latest"  # reasoning model, local
-base_url = "http://localhost:11434"
+id           = "local-deepseek"
+type         = "ollama"
+model        = "deepseek-r1:latest"  # reasoning model, local
+base_url     = "http://localhost:11434"
+capabilities = ["reasoning", "math", "logic", "proof", "step-by-step", "problem-solving"]
 
 # ── AR8 via Tailscale (100.81.145.19) ─────────────────────────────────────────
 
 [[backend]]
-id       = "ar8"
-type     = "ollama"
-model    = "gemma4:latest"       # 8B Gemma — general purpose
-base_url = "http://100.81.145.19:11434"
+id           = "ar8"
+type         = "ollama"
+model        = "gemma4:latest"       # Gemma 4 — general purpose
+base_url     = "http://100.81.145.19:11434"
+capabilities = ["general", "writing", "research", "analysis", "explanation", "translation"]
 
 [[backend]]
-id       = "ar8-coder"
-type     = "ollama"
-model    = "qwen2.5-coder:14b"   # 14B coding specialist — best for code tasks
-base_url = "http://100.81.145.19:11434"
+id           = "ar8-coder"
+type         = "ollama"
+model        = "qwen2.5-coder:14b"   # 14B coding specialist
+base_url     = "http://100.81.145.19:11434"
+capabilities = ["code", "coding", "programming", "debugging", "refactoring", "review", "typescript", "go", "python", "rust", "sql", "bash"]
 
 [[backend]]
-id       = "ar8-qwen"
-type     = "ollama"
-model    = "qwen2.5:7b"          # 7B general, fast on AR8
-base_url = "http://100.81.145.19:11434"
+id           = "ar8-qwen"
+type         = "ollama"
+model        = "qwen2.5:7b"          # 7B general, fast on AR8
+base_url     = "http://100.81.145.19:11434"
+capabilities = ["general", "summary", "translation", "classification", "extraction", "qa"]
 
 # ── Cloud — OpenAI ─────────────────────────────────────────────────────────────
 
 [[backend]]
-id       = "openai"
-type     = "openai"
-model    = "gpt-4o"
-base_url = "https://api.openai.com/v1"
-api_key  = "${OPENAI_API_KEY}"
+id           = "openai"
+type         = "openai"
+model        = "gpt-4o"
+base_url     = "https://api.openai.com/v1"
+api_key      = "${OPENAI_API_KEY}"
+capabilities = ["general", "vision", "multimodal", "analysis", "creative", "long-context"]
 
 [[backend]]
-id       = "codex"
-type     = "openai"
-model    = "o4-mini"             # OpenAI reasoning model
-base_url = "https://api.openai.com/v1"
-api_key  = "${OPENAI_API_KEY}"
+id           = "codex"
+type         = "openai"
+model        = "o4-mini"             # OpenAI reasoning model
+base_url     = "https://api.openai.com/v1"
+api_key      = "${OPENAI_API_KEY}"
+capabilities = ["reasoning", "math", "logic", "planning", "chain-of-thought"]
 
 # ── Cloud — Anthropic / Claude ─────────────────────────────────────────────────
 
 [[backend]]
-id       = "claude"
-type     = "anthropic"
-model    = "claude-opus-4-7"     # most capable
-api_key  = "${ANTHROPIC_API_KEY}"
+id           = "claude"
+type         = "anthropic"
+model        = "claude-opus-4-7"     # most capable
+api_key      = "${ANTHROPIC_API_KEY}"
+capabilities = ["architecture", "complex", "long-context", "planning", "analysis", "creative"]
 
 [[backend]]
-id       = "claude-fast"
-type     = "anthropic"
-model    = "claude-haiku-4-5"    # fastest + cheapest Claude
-api_key  = "${ANTHROPIC_API_KEY}"
+id           = "claude-fast"
+type         = "anthropic"
+model        = "claude-haiku-4-5"    # fastest + cheapest Claude
+api_key      = "${ANTHROPIC_API_KEY}"
+capabilities = ["quick", "classification", "extraction", "summary", "simple"]
 
-# ── Local CLI proxies (use stored credentials, no env vars needed) ────────
-
-[[backend]]
-id       = "claude-code"
-type     = "claude-cli"
-# model  = "claude-opus-4-7"  # uncomment to override model
+# ── Local CLI proxies (use stored credentials, no env vars needed) ────────────
 
 [[backend]]
-id       = "codex-local"
-type     = "codex-cli"
-# model  = "o4-mini"          # uncomment to override model
+id           = "claude-code"
+type         = "claude-cli"
+capabilities = ["architecture", "code", "complex", "tool-use", "planning", "long-context", "agentic"]
+# model      = "claude-opus-4-7"  # uncomment to override model
+
+[[backend]]
+id           = "codex-local"
+type         = "codex-cli"
+capabilities = ["code", "coding", "debugging", "refactoring", "javascript", "typescript", "python"]
+# model      = "o4-mini"          # uncomment to override model
+
+# ── Orchestrators ─────────────────────────────────────────────────────────────
+# Usage: mesh chat --backend <orchestrator-id>
+
+[[orchestrator]]
+id          = "brain"
+coordinator = "claude-code"              # routes decisions via Claude Code
+strategy    = "dynamic"                  # coordinator LLM picks the best worker
+workers     = ["ar8-coder", "ar8", "ar8-qwen", "local-deepseek", "local", "claude-code"]
+fallback    = "claude-code"
+
+[[orchestrator]]
+id          = "brain-local"
+coordinator = "local-8b"                 # fully offline coordinator
+strategy    = "capability"               # deterministic: keyword → capability tag match
+workers     = ["ar8-coder", "ar8", "ar8-qwen", "local-deepseek", "local"]
+fallback    = "ar8"
+
+[[orchestrator]]
+id          = "brain-balanced"
+coordinator = "claude-code"
+strategy    = "round-robin"              # distribute load evenly across workers
+workers     = ["ar8-coder", "ar8", "ar8-qwen", "local"]
+fallback    = "ar8"
 
 # ── Rules ──────────────────────────────────────────────────────────────────────
 

@@ -92,5 +92,48 @@ func validate(m *model.Manifest) error {
 		// claude-cli and codex-cli require no fields beyond id+type
 	}
 
+	// ── orchestrators ─────────────────────────────────────────────────────────
+	seenOrch := map[string]bool{}
+	validStrategies := map[string]bool{
+		"dynamic":      true,
+		"capability":   true,
+		"round-robin":  true,
+		"fastest":      true,
+	}
+	for i, o := range m.Orchestrators {
+		if o.ID == "" {
+			return fmt.Errorf("validation: [[orchestrator]] #%d is missing an id", i+1)
+		}
+		if seenOrch[o.ID] || seenBackends[o.ID] {
+			return fmt.Errorf("validation: duplicate id %q (orchestrator conflicts with backend or another orchestrator)", o.ID)
+		}
+		seenOrch[o.ID] = true
+
+		if o.Coordinator == "" {
+			return fmt.Errorf("validation: orchestrator %q is missing a coordinator", o.ID)
+		}
+		if !seenBackends[o.Coordinator] {
+			return fmt.Errorf("validation: orchestrator %q coordinator %q is not a known backend id", o.ID, o.Coordinator)
+		}
+		if len(o.Workers) == 0 {
+			return fmt.Errorf("validation: orchestrator %q has no workers", o.ID)
+		}
+		for _, wid := range o.Workers {
+			if !seenBackends[wid] {
+				return fmt.Errorf("validation: orchestrator %q worker %q is not a known backend id", o.ID, wid)
+			}
+		}
+		if o.Fallback != "" && !seenBackends[o.Fallback] {
+			return fmt.Errorf("validation: orchestrator %q fallback %q is not a known backend id", o.ID, o.Fallback)
+		}
+		strategy := o.Strategy
+		if strategy == "" {
+			strategy = "dynamic"
+		}
+		if !validStrategies[strategy] {
+			return fmt.Errorf("validation: orchestrator %q has unknown strategy %q (valid: dynamic, capability, round-robin, fastest)", o.ID, strategy)
+		}
+	}
+
 	return nil
 }

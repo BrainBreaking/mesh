@@ -200,34 +200,55 @@ var doctorCmd = &cobra.Command{
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-// resolveBackend loads the manifest, picks a backend by id (or the default),
-// and returns the backend plus the manifest.
-func resolveBackend(manifestPath, backendID string) (*model.Manifest, backend.Backend, error) {
+// resolveBackend loads the manifest and returns the backend plus a display
+// config (id/type/model strings). Transparently handles both [[backend]] and
+// [[orchestrator]] entries — the caller doesn't need to distinguish.
+func resolveBackend(manifestPath, backendID string) (*model.Manifest, backend.Backend, *model.Backend, error) {
 	m, err := config.Load(manifestPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("load manifest: %w", err)
+		return nil, nil, nil, fmt.Errorf("load manifest: %w", err)
 	}
 
-	var cfg *model.Backend
 	if backendID != "" {
-		bc, ok := m.BackendByID(backendID)
-		if !ok {
-			return nil, nil, fmt.Errorf("backend %q not found in manifest", backendID)
+		// ── try regular backend first
+		if bc, ok := m.BackendByID(backendID); ok {
+			b, err := backend.New(bc)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			return m, b, bc, nil
 		}
-		cfg = bc
-	} else {
-		bc, ok := m.DefaultBackend()
-		if !ok {
-			return nil, nil, fmt.Errorf("no [[backend]] entries in manifest")
+		// ── try orchestrator
+		if oc, ok := m.OrchestratorByID(backendID); ok {
+			b, err := backend.NewOrchestrator(oc, m)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			strategy := oc.Strategy
+			if strategy == "" {
+				strategy = "dynamic"
+			}
+			// Synthetic display config so callers can show type/model uniformly.
+			display := &model.Backend{
+				ID:    oc.ID,
+				Type:  "orchestrator",
+				Model: strategy,
+			}
+			return m, b, display, nil
 		}
-		cfg = bc
+		return nil, nil, nil, fmt.Errorf("backend or orchestrator %q not found in manifest", backendID)
 	}
 
-	b, err := backend.New(cfg)
-	if err != nil {
-		return nil, nil, err
+	// ── default: first [[backend]] entry
+	bc, ok := m.DefaultBackend()
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("no [[backend]] entries in manifest")
 	}
-	return m, b, nil
+	b, err := backend.New(bc)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return m, b, bc, nil
 }
 
 // ── chat ──────────────────────────────────────────────────────────────────────
@@ -239,16 +260,9 @@ var chatCmd = &cobra.Command{
 	Use:   "chat",
 	Short: "Start an interactive chat session using a configured backend",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		manifest, b, err := resolveBackend(chatManifest, chatBackendID)
+		manifest, b, bcfg, err := resolveBackend(chatManifest, chatBackendID)
 		if err != nil {
 			return err
-		}
-
-		var bcfg *model.Backend
-		if chatBackendID != "" {
-			bcfg, _ = manifest.BackendByID(chatBackendID)
-		} else {
-			bcfg, _ = manifest.DefaultBackend()
 		}
 
 		system := manifest.SystemPrompt()
@@ -274,7 +288,7 @@ var promptCmd = &cobra.Command{
 	Short: "Send a single message to a configured backend and print the response",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		m, b, err := resolveBackend(promptManifest, promptBackendID)
+		m, b, _, err := resolveBackend(promptManifest, promptBackendID)
 		if err != nil {
 			return err
 		}
