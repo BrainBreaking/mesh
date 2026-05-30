@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -60,35 +61,50 @@ func (we *workerEntry) desc() string {
 	return we.cfg.Type
 }
 
+// ── delegation types ──────────────────────────────────────────────────────────
+
+type delegationCall struct {
+	WorkerID string
+	Task     string
+}
+
+type delegationResult struct {
+	WorkerID string
+	Output   string
+	Err      error
+}
+
 // ── valid strategies ──────────────────────────────────────────────────────────
 
 var validStrategies = map[string]bool{
-	"dynamic":     true,
-	"capability":  true,
-	"round-robin": true,
-	"fastest":     true,
-	"auto":        true, // coordinator chooses strategy + worker in one call
+	"auto":        true, // full agentic loop — coordinator delegates, synthesizes
+	"dynamic":     true, // single routing — coordinator picks one worker
+	"capability":  true, // keyword match, no LLM
+	"round-robin": true, // cycle, no LLM
+	"fastest":     true, // latency-based, no LLM
 }
 
 // ── OrchestratorBackend ───────────────────────────────────────────────────────
 
-// OrchestratorBackend implements Backend (and Commander) and routes every Chat
-// call to one of its worker backends using a coordinator model or a
-// deterministic strategy.  The strategy can be changed at runtime via Command.
+// OrchestratorBackend implements Backend (and Commander).
+//
+//   - "auto" strategy: full agentic loop — coordinator issues <delegate> tags,
+//     workers run in parallel, coordinator synthesizes final answer.
+//   - "dynamic": single routing — coordinator picks one worker per message.
+//   - "capability", "round-robin", "fastest": deterministic, no coordinator call.
 type OrchestratorBackend struct {
 	id          string
 	cfg         *model.Orchestrator
 	coordinator Backend
 	workers     []*workerEntry
 	workerMap   map[string]*workerEntry
-	fallback    *workerEntry // may be nil
+	fallback    *workerEntry
 
-	// mutable strategy — protected by stratMu so Command() and Chat() are safe
 	stratMu  sync.RWMutex
 	strategy string
 
 	rrMu      sync.Mutex
-	rrCounter int // round-robin state
+	rrCounter int
 }
 
 // NewOrchestrator constructs an OrchestratorBackend from a manifest.
@@ -149,17 +165,15 @@ func NewOrchestrator(cfg *model.Orchestrator, m *model.Manifest) (Backend, error
 
 func (o *OrchestratorBackend) ID() string { return o.id }
 
-// getStrategy reads the current strategy (thread-safe).
 func (o *OrchestratorBackend) getStrategy() string {
 	o.stratMu.RLock()
 	defer o.stratMu.RUnlock()
 	return o.strategy
 }
 
-// setStrategy validates and updates the current strategy (thread-safe).
 func (o *OrchestratorBackend) setStrategy(s string) error {
 	if !validStrategies[s] {
-		return fmt.Errorf("unknown strategy %q — valid: dynamic, capability, round-robin, fastest, auto", s)
+		return fmt.Errorf("unknown strategy %q — valid: auto, dynamic, capability, round-robin, fastest", s)
 	}
 	o.stratMu.Lock()
 	defer o.stratMu.Unlock()
@@ -176,34 +190,235 @@ func (o *OrchestratorBackend) Chat(
 	userMsg string,
 	stream func(string),
 ) (string, error) {
-	worker, note := o.route(ctx, o.getStrategy(), userMsg)
-	stream(note)
-
-	start := time.Now()
-	result, err := worker.backend.Chat(ctx, system, history, userMsg, stream)
-	worker.stats.record(float64(time.Since(start).Milliseconds()), err)
-	return result, err
+	switch o.getStrategy() {
+	case "auto":
+		// Full agentic loop: coordinator delegates, workers execute, coordinator synthesizes.
+		return o.agentLoop(ctx, system, history, userMsg, stream)
+	default:
+		// Single routing for dynamic + all deterministic strategies.
+		worker, note := o.routeSingle(ctx, o.getStrategy(), userMsg)
+		stream(note)
+		start := time.Now()
+		result, err := worker.backend.Chat(ctx, system, history, userMsg, stream)
+		worker.stats.record(float64(time.Since(start).Milliseconds()), err)
+		return result, err
+	}
 }
 
-// ── routing dispatcher ────────────────────────────────────────────────────────
+// ── agentic loop ──────────────────────────────────────────────────────────────
 
-func (o *OrchestratorBackend) route(ctx context.Context, strategy, task string) (*workerEntry, string) {
-	switch strategy {
+const maxDelegationRounds = 5
 
-	case "auto":
-		w, chosenStrategy, reason, err := o.routeAuto(ctx, task)
-		if err != nil {
-			w = o.fallbackWorker()
-			return w, fmt.Sprintf("[mesh] auto-routing failed (%v) — falling back to %s\n\n", err, w.cfg.ID)
+// agentLoop is the core of the "auto" strategy.
+//
+// Protocol:
+//  1. Call the coordinator with the task and a system prompt that explains
+//     how to use <delegate> tags.
+//  2. Parse any <delegate worker="id">task</delegate> blocks from the response.
+//  3. Execute all delegations in parallel; collect results.
+//  4. Feed results back to the coordinator.
+//  5. Repeat until the coordinator returns a plain-text final answer (no tags).
+//
+// Workers always receive the original project system prompt so project rules
+// are applied. The coordinator only gets the orchestration system prompt.
+func (o *OrchestratorBackend) agentLoop(
+	ctx context.Context,
+	system string,
+	history []Message,
+	userMsg string,
+	stream func(string),
+) (string, error) {
+	// Coordinator context: starts with original conversation history.
+	coordHistory := make([]Message, len(history))
+	copy(coordHistory, history)
+
+	agentSystem := o.buildAgentSystemPrompt()
+
+	for round := 0; round < maxDelegationRounds; round++ {
+		// On the first round the task is the user message.
+		// On subsequent rounds the task is already in coordHistory.
+		input := userMsg
+		if round > 0 {
+			input = ""
 		}
-		return w, fmt.Sprintf("[mesh] auto → %s via %s (%s) — %s\n\n",
-			w.cfg.ID, chosenStrategy, w.desc(), reason)
 
+		// ── call coordinator (buffered — we need to check for delegation tags)
+		stream(fmt.Sprintf("[mesh] planning (round %d)…\n", round+1))
+
+		var coordBuf strings.Builder
+		_, err := o.coordinator.Chat(ctx, agentSystem, coordHistory, input, func(chunk string) {
+			coordBuf.WriteString(chunk)
+		})
+		if err != nil {
+			if round == 0 {
+				return "", fmt.Errorf("coordinator: %w", err)
+			}
+			// On later rounds, fall through to force-synthesis below.
+			break
+		}
+
+		coordText := strings.TrimSpace(coordBuf.String())
+		calls := parseDelegations(coordText)
+
+		if len(calls) == 0 {
+			// No delegation tags → this IS the final answer.
+			if round > 0 {
+				stream("\n[mesh] synthesis:\n\n")
+			}
+			stream(coordText)
+			return coordText, nil
+		}
+
+		// ── show coordinator's reasoning (text that surrounds the delegate tags)
+		reasoning := strings.TrimSpace(stripDelegationTags(coordText))
+		if reasoning != "" {
+			stream(fmt.Sprintf("[mesh] %s\n\n", reasoning))
+		}
+
+		// ── routing summary
+		workerNames := make([]string, len(calls))
+		for i, c := range calls {
+			workerNames[i] = c.WorkerID
+		}
+		if len(calls) == 1 {
+			stream(fmt.Sprintf("[mesh] → %s\n\n", workerNames[0]))
+		} else {
+			stream(fmt.Sprintf("[mesh] → %s (parallel)\n\n", strings.Join(workerNames, ", ")))
+		}
+
+		// ── execute all delegations in parallel, stream results sequentially
+		results := o.executeParallel(ctx, system, calls, stream)
+
+		// ── feed results back to coordinator
+		coordHistory = append(coordHistory,
+			Message{Role: "assistant", Content: coordText},
+			Message{Role: "user", Content: formatDelegationResults(results)},
+		)
+	}
+
+	// Max rounds hit — force a final synthesis.
+	stream("\n[mesh] max delegation rounds — synthesizing…\n\n")
+	var finalBuf strings.Builder
+	_, err := o.coordinator.Chat(
+		ctx, agentSystem, coordHistory,
+		"Provide your final synthesized answer based on all results gathered so far.",
+		func(chunk string) {
+			stream(chunk)
+			finalBuf.WriteString(chunk)
+		},
+	)
+	return finalBuf.String(), err
+}
+
+// executeParallel runs all delegation calls concurrently.
+// Workers buffer their output internally; results are streamed to the user
+// sequentially in input order once all workers have finished.
+// Running in parallel but displaying sequentially gives the best combination
+// of throughput and readable output.
+func (o *OrchestratorBackend) executeParallel(
+	ctx context.Context,
+	system string,
+	calls []delegationCall,
+	stream func(string),
+) []delegationResult {
+	type indexed struct {
+		i int
+		r delegationResult
+	}
+
+	ch := make(chan indexed, len(calls))
+
+	for i, call := range calls {
+		i, call := i, call
+		we, ok := o.workerMap[call.WorkerID]
+		if !ok {
+			ch <- indexed{i, delegationResult{
+				WorkerID: call.WorkerID,
+				Output:   fmt.Sprintf("[error: worker %q not found]", call.WorkerID),
+			}}
+			continue
+		}
+
+		go func() {
+			start := time.Now()
+			var buf strings.Builder
+			_, err := we.backend.Chat(ctx, system, nil, call.Task, func(chunk string) {
+				buf.WriteString(chunk)
+			})
+			we.stats.record(float64(time.Since(start).Milliseconds()), err)
+			ch <- indexed{i, delegationResult{
+				WorkerID: call.WorkerID,
+				Output:   buf.String(),
+				Err:      err,
+			}}
+		}()
+	}
+
+	// Collect in any order, then sort by original index.
+	results := make([]delegationResult, len(calls))
+	for range calls {
+		r := <-ch
+		results[r.i] = r.r
+	}
+
+	// Stream in original order with clear worker separators.
+	for _, r := range results {
+		header := fmt.Sprintf("─── %s ───────────────────────────────────\n", r.WorkerID)
+		if r.Err != nil {
+			stream(header + fmt.Sprintf("[error: %v]\n\n", r.Err))
+		} else {
+			stream(header + r.Output + "\n\n")
+		}
+	}
+
+	return results
+}
+
+// ── delegation parsing ────────────────────────────────────────────────────────
+
+var delegateRe = regexp.MustCompile(`(?s)<delegate\s+worker="([^"]+)">(.*?)</delegate>`)
+
+func parseDelegations(s string) []delegationCall {
+	matches := delegateRe.FindAllStringSubmatch(s, -1)
+	calls := make([]delegationCall, 0, len(matches))
+	for _, m := range matches {
+		workerID := strings.TrimSpace(m[1])
+		task := strings.TrimSpace(m[2])
+		if workerID != "" && task != "" {
+			calls = append(calls, delegationCall{WorkerID: workerID, Task: task})
+		}
+	}
+	return calls
+}
+
+func stripDelegationTags(s string) string {
+	return delegateRe.ReplaceAllString(s, "")
+}
+
+func formatDelegationResults(results []delegationResult) string {
+	var sb strings.Builder
+	sb.WriteString("Worker results:\n\n")
+	for _, r := range results {
+		sb.WriteString(fmt.Sprintf("[Worker: %s]\n", r.WorkerID))
+		if r.Err != nil {
+			sb.WriteString(fmt.Sprintf("[error: %v]\n", r.Err))
+		} else {
+			sb.WriteString(r.Output)
+		}
+		sb.WriteString("\n\n")
+	}
+	return sb.String()
+}
+
+// ── single routing (dynamic + deterministic strategies) ───────────────────────
+
+func (o *OrchestratorBackend) routeSingle(ctx context.Context, strategy, task string) (*workerEntry, string) {
+	switch strategy {
 	case "dynamic":
 		w, reason, err := o.routeDynamic(ctx, task)
 		if err != nil {
 			w = o.fallbackWorker()
-			return w, fmt.Sprintf("[mesh] dynamic routing failed (%v) — falling back to %s\n\n", err, w.cfg.ID)
+			return w, fmt.Sprintf("[mesh] routing failed (%v) — falling back to %s\n\n", err, w.cfg.ID)
 		}
 		return w, fmt.Sprintf("[mesh] → %s (%s) — %s\n\n", w.cfg.ID, w.desc(), reason)
 
@@ -227,70 +442,6 @@ func (o *OrchestratorBackend) route(ctx context.Context, strategy, task string) 
 		return w, fmt.Sprintf("[mesh] unknown strategy %q — falling back to %s\n\n", strategy, w.cfg.ID)
 	}
 }
-
-// ── auto strategy ─────────────────────────────────────────────────────────────
-
-// routeAuto asks the coordinator to pick both the strategy and (for dynamic)
-// the target worker in a single LLM call.  Returns the chosen worker, the
-// strategy name the coordinator selected, and the reason.
-func (o *OrchestratorBackend) routeAuto(ctx context.Context, task string) (*workerEntry, string, string, error) {
-	sysPrompt := o.buildAutoRouterPrompt()
-
-	var buf strings.Builder
-	_, err := o.coordinator.Chat(ctx, sysPrompt, nil, task, func(chunk string) {
-		buf.WriteString(chunk)
-	})
-	if err != nil {
-		return nil, "", "", fmt.Errorf("coordinator: %w", err)
-	}
-
-	raw := extractJSON(strings.TrimSpace(buf.String()))
-
-	var decision struct {
-		Strategy   string `json:"strategy"`
-		DelegateTo string `json:"delegate_to"`
-		Reason     string `json:"reason"`
-	}
-	if err := json.Unmarshal([]byte(raw), &decision); err != nil {
-		return nil, "", "", fmt.Errorf("coordinator returned invalid JSON (%q): %w", raw, err)
-	}
-	if decision.Strategy == "" {
-		return nil, "", "", fmt.Errorf("coordinator response missing strategy field")
-	}
-
-	reason := decision.Reason
-	if reason == "" {
-		reason = "coordinator decision"
-	}
-
-	switch decision.Strategy {
-	case "dynamic":
-		// Coordinator already picked the worker — no second LLM call needed.
-		if decision.DelegateTo == "" {
-			return nil, "", "", fmt.Errorf("coordinator chose dynamic but omitted delegate_to")
-		}
-		we, ok := o.workerMap[decision.DelegateTo]
-		if !ok {
-			return nil, "", "", fmt.Errorf("coordinator chose unknown worker %q", decision.DelegateTo)
-		}
-		return we, "dynamic", reason, nil
-
-	case "capability":
-		return o.routeByCapability(task), "capability", reason, nil
-
-	case "round-robin":
-		return o.routeRoundRobin(), "round-robin", reason, nil
-
-	case "fastest":
-		w, _ := o.routeFastest()
-		return w, "fastest", reason, nil
-
-	default:
-		return nil, "", "", fmt.Errorf("coordinator returned unknown strategy %q", decision.Strategy)
-	}
-}
-
-// ── dynamic strategy ──────────────────────────────────────────────────────────
 
 func (o *OrchestratorBackend) routeDynamic(ctx context.Context, task string) (*workerEntry, string, error) {
 	var buf strings.Builder
@@ -322,8 +473,6 @@ func (o *OrchestratorBackend) routeDynamic(ctx context.Context, task string) (*w
 	}
 	return we, reason, nil
 }
-
-// ── deterministic strategies ──────────────────────────────────────────────────
 
 func (o *OrchestratorBackend) routeByCapability(task string) *workerEntry {
 	taskLower := strings.ToLower(task)
@@ -357,7 +506,7 @@ func (o *OrchestratorBackend) routeFastest() (*workerEntry, float64) {
 	for _, we := range o.workers {
 		_, _, avg, _ := we.stats.snapshot()
 		if avg == 0 {
-			return we, 0 // never used — prefer to collect a data point
+			return we, 0
 		}
 		if avg < bestLatency {
 			bestLatency = avg
@@ -391,8 +540,42 @@ func (o *OrchestratorBackend) workerTable() string {
 	return sb.String()
 }
 
+// buildAgentSystemPrompt is used by the agentic loop ("auto" strategy).
+// The coordinator receives this on every round; it explains the delegation
+// protocol and lists available workers.
+func (o *OrchestratorBackend) buildAgentSystemPrompt() string {
+	workers := o.workerTable()
+	return `You are the mesh orchestrator. You solve tasks by coordinating specialized AI workers.
+
+Available workers:
+` + workers + `
+── Delegation protocol ───────────────────────────────────────────────────────
+
+To delegate work to a specialized worker, use this exact XML syntax:
+
+<delegate worker="WORKER_ID">
+Task description for this worker — be specific and self-contained.
+</delegate>
+
+You may delegate to multiple workers at once; they execute in parallel:
+
+<delegate worker="ar8-coder">Write the Go implementation</delegate>
+<delegate worker="ar8">Write the explanation and docstring</delegate>
+
+── Rules ─────────────────────────────────────────────────────────────────────
+
+1. For tasks that need specialization, delegate to the best-suited worker.
+2. For simple conversational questions, answer directly without delegating.
+3. When you receive worker results, synthesize them into a coherent final answer.
+4. If a worker result is incomplete, you may re-delegate to fix it.
+5. Maximum 5 delegation rounds per request.
+6. Your FINAL answer must be plain text — no <delegate> tags.
+7. Worker IDs must exactly match one of the IDs listed above.
+`
+}
+
 func (o *OrchestratorBackend) buildDynamicRouterPrompt() string {
-	return "You are the mesh task router. Pick the best worker for the task.\n\n" +
+	return "You are the mesh task router. Pick the best single worker for the task.\n\n" +
 		"Workers:\n" + o.workerTable() +
 		"\nRules:\n" +
 		"- Respond with ONLY a JSON object. No preamble, no markdown.\n" +
@@ -401,44 +584,23 @@ func (o *OrchestratorBackend) buildDynamicRouterPrompt() string {
 		`Required format: {"delegate_to":"<worker_id>","reason":"<why>"}` + "\n"
 }
 
-func (o *OrchestratorBackend) buildAutoRouterPrompt() string {
-	return "You are the mesh meta-router. Decide the routing strategy AND the target worker.\n\n" +
-		"Strategies:\n" +
-		"  dynamic      pick a specific worker based on task semantics (you choose delegate_to)\n" +
-		"  capability   keyword matching — good for clear-cut task types\n" +
-		"  round-robin  distribute evenly — good when any worker would do\n" +
-		"  fastest      pick by latency — good for trivial/time-sensitive tasks\n\n" +
-		"Workers:\n" + o.workerTable() +
-		"\nRules:\n" +
-		"- Respond with ONLY a JSON object. No preamble, no markdown.\n" +
-		"- When strategy is 'dynamic', delegate_to must be set to a valid worker ID.\n" +
-		"- For other strategies, omit delegate_to or set it to null.\n" +
-		"- Keep reason under 10 words.\n\n" +
-		`Required format: {"strategy":"<strategy>","delegate_to":"<worker_id_or_null>","reason":"<why>"}` + "\n"
-}
-
 // ── Commander interface ───────────────────────────────────────────────────────
 
-// Command handles slash commands for runtime orchestrator control.
-// Implements the Commander interface from the backend package.
 func (o *OrchestratorBackend) Command(cmd string) (string, error) {
-	parts := strings.Fields(strings.TrimPrefix(strings.TrimPrefix(cmd, "/"), "/"))
+	parts := strings.Fields(strings.TrimPrefix(cmd, "/"))
 	if len(parts) == 0 {
 		return o.helpText(), nil
 	}
 
 	switch parts[0] {
-
 	case "strategy":
 		if len(parts) == 1 {
-			// show current
-			return fmt.Sprintf("current strategy: %s\nvalid: dynamic, capability, round-robin, fastest, auto", o.getStrategy()), nil
+			return fmt.Sprintf("current strategy: %s\nvalid: auto, dynamic, capability, round-robin, fastest", o.getStrategy()), nil
 		}
-		newStrat := parts[1]
-		if err := o.setStrategy(newStrat); err != nil {
+		if err := o.setStrategy(parts[1]); err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("strategy → %s", newStrat), nil
+		return fmt.Sprintf("strategy → %s", parts[1]), nil
 
 	case "workers":
 		return o.workersText(), nil
@@ -456,7 +618,7 @@ func (o *OrchestratorBackend) Command(cmd string) (string, error) {
 
 func (o *OrchestratorBackend) workersText() string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("orchestrator: %s  (coordinator: %s)\n\n", o.id, o.cfg.Coordinator))
+	sb.WriteString(fmt.Sprintf("orchestrator: %s  coordinator: %s\n\n", o.id, o.cfg.Coordinator))
 	sb.WriteString(fmt.Sprintf("%-22s  %-30s  %s\n", "worker", "model", "capabilities"))
 	sb.WriteString(strings.Repeat("─", 80) + "\n")
 	for _, we := range o.workers {
@@ -500,14 +662,16 @@ func (o *OrchestratorBackend) helpText() string {
 	return fmt.Sprintf(`orchestrator: %s  strategy: %s
 
 /strategy              show current strategy
-/strategy <name>       change strategy (dynamic | capability | round-robin | fastest | auto)
+/strategy <name>       change strategy on the fly
 /workers               list workers and their capabilities
 /stats                 per-worker call counts and latency metrics
 /help                  show this help
 
 strategies:
-  auto         coordinator picks strategy + worker in one call (recommended)
-  dynamic      coordinator picks the worker (1 LLM call per message)
+  auto         full agentic loop — coordinator delegates to workers, synthesizes
+               results. supports parallel delegation across multiple workers.
+               (coordinator uses <delegate worker="id"> protocol)
+  dynamic      single routing — coordinator picks one worker per message (fast)
   capability   keyword match against capability tags (no LLM call)
   round-robin  cycle through workers in order (no LLM call)
   fastest      pick worker with lowest avg latency (no LLM call)`, o.id, o.getStrategy())
