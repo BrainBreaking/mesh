@@ -67,6 +67,11 @@ type ChatModel struct {
 	// elapsed timer — set when streaming starts, read on every spinner tick.
 	streamStartedAt time.Time
 
+	// autocomplete state
+	comps        []suggestion // current candidate list (nil = popup hidden)
+	compIdx      int          // selected index; -1 = nothing selected
+	hasCommander bool         // backend supports slash commands
+
 	// session dependencies
 	sess        *chat.Session
 	backendID   string
@@ -117,16 +122,20 @@ func newChatModel(
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	hasCommander := sess.HasCommander()
+
 	return ChatModel{
-		ta:          ta,
-		spin:        sp,
-		sess:        sess,
-		backendID:   backendID,
-		backendType: backendType,
-		modelName:   modelName,
-		rulesCount:  rulesCount,
-		ctx:         ctx,
-		cancel:      cancel,
+		ta:           ta,
+		spin:         sp,
+		sess:         sess,
+		backendID:    backendID,
+		backendType:  backendType,
+		modelName:    modelName,
+		rulesCount:   rulesCount,
+		ctx:          ctx,
+		cancel:       cancel,
+		compIdx:      -1,
+		hasCommander: hasCommander,
 	}
 }
 
@@ -157,12 +166,49 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cancel()
 			return m, tea.Quit
 
+		// ── autocomplete navigation ────────────────────────────────────────
+		case tea.KeyTab:
+			if len(m.comps) > 0 {
+				m.compIdx = (m.compIdx + 1) % len(m.comps)
+				return m, nil
+			}
+
+		case tea.KeyShiftTab:
+			if len(m.comps) > 0 {
+				if m.compIdx <= 0 {
+					m.compIdx = len(m.comps) - 1
+				} else {
+					m.compIdx--
+				}
+				return m, nil
+			}
+
+		case tea.KeyEscape:
+			if len(m.comps) > 0 {
+				m.comps = nil
+				m.compIdx = -1
+				m.applyResize()
+				return m, nil
+			}
+
 		case tea.KeyEnter:
+			// Accept the highlighted completion instead of sending.
+			if m.compIdx >= 0 && m.compIdx < len(m.comps) {
+				m.ta.SetValue(m.comps[m.compIdx].full)
+				m.comps = nil
+				m.compIdx = -1
+				m.applyResize()
+				return m, nil
+			}
+
 			text := strings.TrimSpace(m.ta.Value())
 			if text == "" {
 				return m, nil
 			}
 			m.ta.Reset()
+			m.comps = nil
+			m.compIdx = -1
+			m.applyResize()
 
 			// Slash commands are always handled immediately, never queued.
 			if strings.HasPrefix(text, "/") {
@@ -260,6 +306,9 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.ta, taCmd = m.ta.Update(msg)
 	cmds = append(cmds, taCmd)
 
+	// Recompute autocomplete suggestions after every textarea change.
+	m.updateCompletions(m.ta.Value())
+
 	var vpCmd tea.Cmd
 	m.vp, vpCmd = m.vp.Update(msg)
 	cmds = append(cmds, vpCmd)
@@ -273,10 +322,12 @@ func (m ChatModel) View() string {
 	if !m.ready {
 		return "loading…\n"
 	}
-	return m.renderStatusBar() + "\n" +
-		m.vp.View() + "\n" +
-		m.ta.View() + "\n" +
-		m.renderHintBar()
+	parts := m.renderStatusBar() + "\n" +
+		m.vp.View() + "\n"
+	if len(m.comps) > 0 {
+		parts += m.renderCompletions() + "\n"
+	}
+	return parts + m.ta.View() + "\n" + m.renderHintBar()
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -297,7 +348,7 @@ func (m *ChatModel) applyResize() {
 		taLines     = 5 // textarea height + surrounding newlines
 		separators  = 3 // newlines between sections
 	)
-	vpH := m.height - statusLines - hintLines - taLines - separators
+	vpH := m.height - statusLines - hintLines - taLines - separators - m.completionHeight()
 	if vpH < 4 {
 		vpH = 4
 	}
@@ -519,7 +570,7 @@ func (m ChatModel) renderStatusBar() string {
 
 func (m ChatModel) renderHintBar() string {
 	return styleHint.Render(
-		" enter send  ·  /help commands  ·  shift+enter newline  ·  ↑/↓ scroll  ·  ctrl+l clear  ·  ctrl+c quit",
+		" enter send  ·  / commands  ·  tab complete  ·  shift+enter newline  ·  ↑/↓ scroll  ·  ctrl+l clear  ·  ctrl+c quit",
 	)
 }
 
@@ -566,6 +617,97 @@ func (m *ChatModel) listenForEvent() tea.Cmd {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+// ── autocomplete ──────────────────────────────────────────────────────────────
+
+const maxCompletions = 6
+
+// completionHeight returns the number of terminal lines the completion popup
+// currently occupies (0 when hidden, N items + 2 for the border otherwise).
+func (m *ChatModel) completionHeight() int {
+	n := len(m.comps)
+	if n == 0 {
+		return 0
+	}
+	if n > maxCompletions {
+		n = maxCompletions
+	}
+	return n + 2 // +2: top + bottom border
+}
+
+// updateCompletions recomputes the suggestion list from the current input.
+// When the list size changes it calls applyResize so the viewport adjusts.
+func (m *ChatModel) updateCompletions(input string) {
+	prev := len(m.comps)
+	m.comps = buildSuggestions(input, m.hasCommander)
+	// Keep selection in bounds.
+	if m.compIdx >= len(m.comps) {
+		m.compIdx = -1
+	}
+	if len(m.comps) != prev && m.ready {
+		m.applyResize() // adjusts viewport height; also calls updateViewport
+	}
+}
+
+// renderCompletions draws the autocomplete popup.
+func (m *ChatModel) renderCompletions() string {
+	// Inner width: full width minus border(2) minus padding(2) minus margin(1).
+	innerW := m.width - 5
+	if innerW < 20 {
+		innerW = 20
+	}
+
+	// Command column: widest command text + 2 padding.
+	cmdW := 0
+	limit := len(m.comps)
+	if limit > maxCompletions {
+		limit = maxCompletions
+	}
+	for _, s := range m.comps[:limit] {
+		if w := lipgloss.Width(s.full); w > cmdW {
+			cmdW = w
+		}
+	}
+	cmdW += 2
+
+	var rows []string
+	for i, s := range m.comps[:limit] {
+		// Pad command to fixed width.
+		cmdPart := s.full + strings.Repeat(" ", cmdW-len(s.full))
+		descPart := s.desc
+
+		// Truncate description if it would overflow.
+		descMax := innerW - cmdW - 1
+		if descMax < 0 {
+			descMax = 0
+		}
+		if len(descPart) > descMax {
+			descPart = descPart[:descMax-1] + "…"
+		}
+
+		line := cmdPart + styleCompDesc.Render(descPart)
+
+		if i == m.compIdx {
+			// Selected row: highlight entire line.
+			rows = append(rows, styleCompSelected.Width(innerW).Render(cmdPart+descPart))
+		} else {
+			rows = append(rows, styleCompItem.Render(line))
+		}
+	}
+
+	// Show overflow hint if list was trimmed.
+	if len(m.comps) > maxCompletions {
+		extra := len(m.comps) - maxCompletions
+		rows = append(rows, styleCompDesc.Render(
+			fmt.Sprintf("  … %d more (keep typing to narrow)", extra),
+		))
+	}
+
+	content := strings.Join(rows, "\n")
+	return styleCompBox.Width(m.width - 3).Render(content)
+}
+
+// ── misc helpers ──────────────────────────────────────────────────────────────
 
 // formatElapsed formats a duration as a compact human-readable string for the
 // streaming indicator: "0s", "12s", "1m04s", "2m30s", etc.

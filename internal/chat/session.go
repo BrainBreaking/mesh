@@ -6,6 +6,13 @@ import (
 	"github.com/BrainBreaking/mesh/internal/backend"
 )
 
+// HasCommander reports whether the underlying backend supports slash commands.
+// The TUI uses this to decide which autocomplete entries to offer.
+func (s *Session) HasCommander() bool {
+	_, ok := s.Backend.(backend.Commander)
+	return ok
+}
+
 // Command routes a slash command (e.g. "/strategy dynamic") to the backend
 // if it implements the Commander interface.
 // Returns (response, true) when the backend handled it, ("", false) otherwise.

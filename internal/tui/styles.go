@@ -96,3 +96,29 @@ var (
 		Foreground(lipgloss.Color("3")). // yellow
 		Bold(true)
 )
+
+// ── autocomplete popup ────────────────────────────────────────────────────────
+
+var (
+	// Container box drawn around the completion list.
+	styleCompBox = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colMuted).
+			PaddingLeft(1).
+			PaddingRight(1).
+			MarginLeft(1)
+
+	// Normal (unselected) completion row.
+	styleCompItem = lipgloss.NewStyle().
+			Foreground(colWhite)
+
+	// Selected completion row — bold command text, highlighted background.
+	styleCompSelected = lipgloss.NewStyle().
+				Foreground(colBlack).
+				Background(colCyan).
+				Bold(true)
+
+	// Dimmed description column shown to the right of the command.
+	styleCompDesc = lipgloss.NewStyle().
+			Foreground(colMuted)
+)
