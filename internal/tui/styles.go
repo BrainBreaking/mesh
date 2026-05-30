@@ -86,4 +86,13 @@ var (
 		Italic(true).
 		PaddingLeft(2).
 		PaddingTop(1)
+
+	// System messages (slash-command responses) use a minimal inline style —
+	// no bubble border, just a dim indicator prefix.
+	styleSystemLine = lipgloss.NewStyle().
+		Foreground(colMuted)
+
+	styleSystemLabel = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("3")). // yellow
+		Bold(true)
 )

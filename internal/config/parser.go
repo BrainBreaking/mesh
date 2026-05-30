@@ -95,10 +95,11 @@ func validate(m *model.Manifest) error {
 	// ── orchestrators ─────────────────────────────────────────────────────────
 	seenOrch := map[string]bool{}
 	validStrategies := map[string]bool{
-		"dynamic":      true,
-		"capability":   true,
-		"round-robin":  true,
-		"fastest":      true,
+		"dynamic":     true,
+		"capability":  true,
+		"round-robin": true,
+		"fastest":     true,
+		"auto":        true, // coordinator picks strategy + worker in one call
 	}
 	for i, o := range m.Orchestrators {
 		if o.ID == "" {

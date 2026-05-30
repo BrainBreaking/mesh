@@ -6,6 +6,21 @@ import (
 	"github.com/BrainBreaking/mesh/internal/backend"
 )
 
+// Command routes a slash command (e.g. "/strategy dynamic") to the backend
+// if it implements the Commander interface.
+// Returns (response, true) when the backend handled it, ("", false) otherwise.
+func (s *Session) Command(cmd string) (string, bool) {
+	c, ok := s.Backend.(backend.Commander)
+	if !ok {
+		return "", false
+	}
+	result, err := c.Command(cmd)
+	if err != nil {
+		return "error: " + err.Error(), true
+	}
+	return result, true
+}
+
 // Session manages a multi-turn conversation with a backend.
 type Session struct {
 	System  string

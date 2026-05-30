@@ -116,7 +116,7 @@ capabilities = ["code", "coding", "debugging", "refactoring", "javascript", "typ
 [[orchestrator]]
 id          = "brain"
 coordinator = "claude-code"              # routes decisions via Claude Code
-strategy    = "dynamic"                  # coordinator LLM picks the best worker
+strategy    = "auto"                     # coordinator picks strategy + worker in one call
 workers     = ["ar8-coder", "ar8", "ar8-qwen", "local-deepseek", "local", "claude-code"]
 fallback    = "claude-code"
 

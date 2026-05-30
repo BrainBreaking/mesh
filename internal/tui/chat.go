@@ -31,6 +31,7 @@ const (
 	roleUser entryRole = iota
 	roleAssistant
 	roleError
+	roleSystem // slash-command responses
 )
 
 type entry struct {
@@ -159,6 +160,24 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.ta.Reset()
+
+			// Slash commands are handled locally — not sent to the model.
+			if strings.HasPrefix(text, "/") {
+				response, handled := m.sess.Command(text)
+				msg := response
+				if !handled {
+					msg = "this backend doesn't support commands — only orchestrators do\ntry: mesh chat --backend brain"
+				}
+				m.entries = append(m.entries, entry{
+					role: roleSystem,
+					raw:  msg,
+					at:   time.Now(),
+				})
+				m.updateViewport()
+				m.vp.GotoBottom()
+				return m, nil
+			}
+
 			cmds = append(cmds, m.startSend(text))
 			// Early return: don't forward enter to textarea (avoid newline insertion).
 			return m, tea.Batch(cmds...)
@@ -344,6 +363,11 @@ func (m *ChatModel) buildContent() string {
 }
 
 func (m *ChatModel) renderBubble(e entry, innerW int) string {
+	// System messages use a compact inline style — no bubble border.
+	if e.role == roleSystem {
+		return m.renderSystemMsg(e, innerW)
+	}
+
 	// ── header: "label   <spacer>   HH:MM [spinner]"
 	ts := e.at.Format("15:04")
 
@@ -411,6 +435,27 @@ func (m *ChatModel) renderBubble(e entry, innerW int) string {
 	}
 }
 
+// renderSystemMsg renders a slash-command response as a compact inline block
+// (no rounded border — visually distinct from chat bubbles).
+func (m *ChatModel) renderSystemMsg(e entry, width int) string {
+	ts := styleTimestamp.Render(e.at.Format("15:04"))
+	header := styleSystemLabel.Render("○ mesh") + "  " + ts
+
+	// Each line of the body gets a leading dim bar.
+	var bodyLines []string
+	for _, line := range strings.Split(e.raw, "\n") {
+		bodyLines = append(bodyLines, styleSystemLine.Render("  "+line))
+	}
+	body := strings.Join(bodyLines, "\n")
+
+	content := header + "\n" + body
+	return lipgloss.NewStyle().
+		MarginLeft(1).
+		MarginBottom(1).
+		Width(width + 4).
+		Render(content)
+}
+
 // ── status bar ────────────────────────────────────────────────────────────────
 
 func (m ChatModel) renderStatusBar() string {
@@ -443,7 +488,7 @@ func (m ChatModel) renderStatusBar() string {
 
 func (m ChatModel) renderHintBar() string {
 	return styleHint.Render(
-		" enter send  ·  shift+enter newline  ·  ↑/↓ scroll  ·  ctrl+l clear  ·  ctrl+c quit",
+		" enter send  ·  /help commands  ·  shift+enter newline  ·  ↑/↓ scroll  ·  ctrl+l clear  ·  ctrl+c quit",
 	)
 }
 
