@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	engstore "github.com/BrainBreaking/engram/store"
 	"github.com/BrainBreaking/mesh/internal/backend"
 	"github.com/BrainBreaking/mesh/internal/chat"
 	"github.com/BrainBreaking/mesh/internal/compiler"
@@ -265,6 +266,17 @@ var chatCmd = &cobra.Command{
 			return err
 		}
 
+		// Open engram memory store. Non-fatal: if engram is unavailable the
+		// chat still works, just without memory features.
+		mem, memErr := engstore.Open(engstore.DefaultDataDir())
+		if memErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: engram unavailable (%v) — memory features disabled\n", memErr)
+			mem = nil
+		}
+		if mem != nil {
+			defer mem.Close()
+		}
+
 		system := manifest.SystemPrompt()
 		sess := chat.New(b, system)
 
@@ -274,6 +286,7 @@ var chatCmd = &cobra.Command{
 			bcfg.Type,
 			bcfg.Model,
 			len(manifest.Rules),
+			mem,
 		)
 	},
 }

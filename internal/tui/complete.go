@@ -19,6 +19,9 @@ type cmdDef struct {
 var allCmdDefs = []cmdDef{
 	{"/help", "list available commands", false},
 	{"/clear", "clear the conversation", false},
+	{"/remember", "save a note to memory", false},
+	{"/recall", "search memory and display results", false},
+	{"/forget", "soft-delete a memory by id", false},
 	{"/strategy", "show or change routing strategy", true},
 	{"/strategy dynamic", "route based on per-request analysis", true},
 	{"/strategy capability", "match keywords to capability tags", true},

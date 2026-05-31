@@ -47,11 +47,22 @@ func New(b backend.Backend, system string) *Session {
 // Send appends the user message to history, calls the backend, appends the
 // assistant response to history, and returns the full response string.
 func (s *Session) Send(ctx context.Context, userMsg string, stream func(chunk string)) (string, error) {
+	return s.SendWithContext(ctx, "", userMsg, stream)
+}
+
+// SendWithContext is like Send but prepends systemExtra to the system prompt
+// for this turn only (the extra content is not stored in history). Used by
+// the TUI to inject memory-retrieved context without polluting the session.
+func (s *Session) SendWithContext(ctx context.Context, systemExtra, userMsg string, stream func(chunk string)) (string, error) {
 	s.History = append(s.History, backend.Message{Role: "user", Content: userMsg})
 
-	reply, err := s.Backend.Chat(ctx, s.System, s.History[:len(s.History)-1], userMsg, stream)
+	system := s.System
+	if systemExtra != "" {
+		system = systemExtra + "\n\n" + s.System
+	}
+
+	reply, err := s.Backend.Chat(ctx, system, s.History[:len(s.History)-1], userMsg, stream)
 	if err != nil {
-		// Remove the user message we just appended so the caller can retry.
 		s.History = s.History[:len(s.History)-1]
 		return "", err
 	}

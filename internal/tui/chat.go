@@ -3,8 +3,10 @@ package tui
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 
+	engstore "github.com/BrainBreaking/engram/store"
 	"github.com/BrainBreaking/mesh/internal/chat"
 )
 
@@ -23,7 +26,11 @@ import (
 
 type chunkMsg string
 
-type streamDone struct{ err error }
+type streamDone struct {
+	err       error
+	userMsg   string // original user message, used for auto-save
+	sessionID string
+}
 
 // ── entry ─────────────────────────────────────────────────────────────────────
 
@@ -74,6 +81,11 @@ type ChatModel struct {
 	compIdx      int          // selected index; -1 = nothing selected
 	hasCommander bool         // backend supports slash commands
 
+	// engram memory
+	mem       *engstore.Store // nil when engram is unavailable
+	sessionID string          // active engram session
+	memCount  int64           // cached observation count (updated optimistically)
+
 	// session dependencies
 	sess        *chat.Session
 	backendID   string
@@ -94,15 +106,27 @@ type ChatModel struct {
 // ── RunChat ───────────────────────────────────────────────────────────────────
 
 // RunChat starts the TUI and blocks until the user quits.
-func RunChat(sess *chat.Session, backendID, backendType, modelName string, rulesCount int) error {
+// mem may be nil — all memory features degrade gracefully when absent.
+func RunChat(sess *chat.Session, backendID, backendType, modelName string, rulesCount int, mem *engstore.Store) error {
 	// Detect terminal background colour HERE, before tea.NewProgram() puts the
-	// terminal into raw mode.  glamour.WithAutoStyle() sends an OSC escape to
+	// terminal into raw mode. glamour.WithAutoStyle() sends an OSC escape to
 	// query the background; if that query fires while Bubbletea owns stdin, the
 	// terminal's reply (e.g. "11;rgb:2828/2c2c/3434") is read as keyboard input
 	// and injected into the textarea as garbage text.
 	glamourStyle := probeGlamourStyle()
 
-	m := newChatModel(sess, backendID, backendType, modelName, rulesCount, glamourStyle)
+	// Start an engram session so we can associate memories with this chat.
+	// The defer ends it when p.Run() returns (covers Ctrl+C and normal quit).
+	var sessionID string
+	if mem != nil {
+		sessionID = fmt.Sprintf("mesh-%d", time.Now().UnixNano())
+		cwd, _ := os.Getwd()
+		mem.StartSession(sessionID, backendID, cwd)
+		defer mem.EndSession(sessionID, //nolint:errcheck
+			fmt.Sprintf("mesh chat · backend=%s · model=%s", backendID, modelName))
+	}
+
+	m := newChatModel(sess, backendID, backendType, modelName, rulesCount, glamourStyle, mem, sessionID)
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err := p.Run()
 	return err
@@ -124,6 +148,8 @@ func newChatModel(
 	backendID, backendType, modelName string,
 	rulesCount int,
 	glamourStyle string,
+	mem *engstore.Store,
+	sessionID string,
 ) ChatModel {
 	ta := textarea.New()
 	ta.Placeholder = "Type a message…  (shift+enter for newline)"
@@ -144,6 +170,16 @@ func newChatModel(
 
 	hasCommander := sess.HasCommander()
 
+	// Seed memory count from store stats (best-effort).
+	var memCount int64
+	if mem != nil {
+		if stats, err := mem.Stats(); err == nil {
+			if n, ok := stats["total_observations"].(int64); ok {
+				memCount = n
+			}
+		}
+	}
+
 	return ChatModel{
 		ta:           ta,
 		spin:         sp,
@@ -157,6 +193,9 @@ func newChatModel(
 		compIdx:      -1,
 		hasCommander: hasCommander,
 		glamourStyle: glamourStyle,
+		mem:          mem,
+		sessionID:    sessionID,
+		memCount:     memCount,
 	}
 }
 
@@ -233,11 +272,32 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Slash commands are always handled immediately, never queued.
 			if strings.HasPrefix(text, "/") {
-				response, handled := m.sess.Command(text)
-				sysMsg := response
-				if !handled {
-					sysMsg = "this backend doesn't support commands — only orchestrators do\ntry: mesh chat --backend brain"
+				var sysMsg string
+
+				// ── memory commands (handled by TUI, no backend call) ──────────
+				switch {
+				case strings.HasPrefix(text, "/remember "):
+					sysMsg = m.handleRemember(strings.TrimPrefix(text, "/remember "))
+				case text == "/remember":
+					sysMsg = "usage: /remember <text to store>"
+				case strings.HasPrefix(text, "/recall "):
+					sysMsg = m.handleRecall(strings.TrimPrefix(text, "/recall "))
+				case text == "/recall":
+					sysMsg = "usage: /recall <search query>"
+				case strings.HasPrefix(text, "/forget "):
+					sysMsg = m.handleForget(strings.TrimPrefix(text, "/forget "))
+				case text == "/forget":
+					sysMsg = "usage: /forget <memory id>"
+
+				// ── orchestrator + fallback commands ──────────────────────────
+				default:
+					response, handled := m.sess.Command(text)
+					sysMsg = response
+					if !handled {
+						sysMsg = "this backend doesn't support commands — only orchestrators do\ntry: mesh chat --backend brain"
+					}
 				}
+
 				m.entries = append(m.entries, entry{
 					role: roleSystem,
 					raw:  sysMsg,
@@ -304,6 +364,17 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.updateViewport()
 		m.vp.GotoBottom()
+
+		// Auto-save the exchange to engram (fire-and-forget goroutine).
+		if m.mem != nil && msg.err == nil && len(m.entries) >= 2 {
+			n := len(m.entries)
+			assistantResp := m.entries[n-1].raw
+			if assistantResp != "" && msg.userMsg != "" {
+				m.memCount++
+				mem, sessionID, project, userMsg := m.mem, m.sessionID, m.backendID, msg.userMsg
+				go autoSave(mem, sessionID, project, userMsg, assistantResp)
+			}
+		}
 
 		// Auto-send the next queued message, if any.
 		if len(m.queue) > 0 {
@@ -563,8 +634,12 @@ func (m ChatModel) renderStatusBar() string {
 	if mn == "" {
 		mn = "—"
 	}
-	left := fmt.Sprintf(" mesh · %s · %s · %d rules",
-		m.backendType, mn, m.rulesCount)
+	memPart := ""
+	if m.mem != nil {
+		memPart = fmt.Sprintf(" · mem:%d", m.memCount)
+	}
+	left := fmt.Sprintf(" mesh · %s · %s · %d rules%s",
+		m.backendType, mn, m.rulesCount, memPart)
 
 	turns := 0
 	for _, e := range m.entries {
@@ -616,14 +691,21 @@ func (m *ChatModel) startSend(text string) tea.Cmd {
 
 	ch := make(chan tea.Msg, 256)
 	m.eventCh = ch
+	// Capture values for the goroutine — don't hold a reference to m.
 	sess := m.sess
 	ctx := m.ctx
+	mem := m.mem
+	project := m.backendID
+	sessionID := m.sessionID
 
 	go func() {
-		_, err := sess.Send(ctx, text, func(chunk string) {
+		// Search engram for relevant context and inject it into this turn's
+		// system prompt. If memory is unavailable or empty the call is a no-op.
+		memCtx := buildMemoryContext(mem, text, project)
+		_, err := sess.SendWithContext(ctx, memCtx, text, func(chunk string) {
 			ch <- chunkMsg(chunk)
 		})
-		ch <- streamDone{err: err}
+		ch <- streamDone{err: err, userMsg: text, sessionID: sessionID}
 	}()
 
 	return tea.Batch(m.listenForEvent(), m.spin.Tick)
@@ -635,6 +717,133 @@ func (m *ChatModel) listenForEvent() tea.Cmd {
 	return func() tea.Msg {
 		return <-ch
 	}
+}
+
+// ── engram memory helpers ─────────────────────────────────────────────────────
+
+// buildMemoryContext searches engram for observations relevant to the user's
+// message and formats them as a compact context block to prepend to the system
+// prompt. Returns "" when memory is unavailable or nothing matches.
+func buildMemoryContext(mem *engstore.Store, query, project string) string {
+	if mem == nil || strings.TrimSpace(query) == "" {
+		return ""
+	}
+	results, err := mem.Search(query, project, "project", "", 4, 0)
+	if err != nil || len(results) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("── engram memory context ────────────────────────────────\n")
+	for _, obs := range results {
+		body := obs.Content
+		if len(body) > 200 {
+			body = body[:197] + "…"
+		}
+		sb.WriteString(fmt.Sprintf("• [%s] %s: %s\n", obs.Type, obs.Title, body))
+	}
+	sb.WriteString("─────────────────────────────────────────────────────────")
+	return sb.String()
+}
+
+// autoSave persists a completed chat exchange as an engram observation.
+// Runs in its own goroutine — errors are silently discarded so the UI is
+// never blocked or interrupted.
+func autoSave(mem *engstore.Store, sessionID, project, userMsg, response string) {
+	title := "Q: " + userMsg
+	if len(title) > 80 {
+		title = title[:77] + "…"
+	}
+	mem.SaveObservation(engstore.SaveObservationParams{ //nolint:errcheck
+		SessionID: sessionID,
+		Type:      "response",
+		Title:     title,
+		Content:   response,
+		ToolName:  "mesh",
+		Project:   project,
+		Scope:     "project",
+		TopicKey:  msgTopicKey(userMsg),
+	})
+}
+
+// msgTopicKey returns a short stable key for deduplicating repeated questions.
+func msgTopicKey(s string) string {
+	h := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(s))))
+	return fmt.Sprintf("%x", h[:8])
+}
+
+// handleRemember saves a manual note to engram and returns a status string.
+func (m *ChatModel) handleRemember(content string) string {
+	if m.mem == nil {
+		return "memory not available (engram not loaded)"
+	}
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return "usage: /remember <text to store>"
+	}
+	title := content
+	if len(title) > 72 {
+		title = title[:69] + "…"
+	}
+	obs, err := m.mem.SaveObservation(engstore.SaveObservationParams{
+		SessionID: m.sessionID,
+		Type:      "manual",
+		Title:     title,
+		Content:   content,
+		ToolName:  "mesh",
+		Project:   m.backendID,
+		Scope:     "project",
+	})
+	if err != nil {
+		return "error saving memory: " + err.Error()
+	}
+	m.memCount++
+	return fmt.Sprintf("✓ saved memory #%d: %s", obs.ID, title)
+}
+
+// handleRecall searches engram and returns a formatted results string.
+func (m *ChatModel) handleRecall(query string) string {
+	if m.mem == nil {
+		return "memory not available (engram not loaded)"
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return "usage: /recall <search query>"
+	}
+	results, err := m.mem.Search(query, m.backendID, "project", "", 5, 0)
+	if err != nil {
+		return "error searching memory: " + err.Error()
+	}
+	if len(results) == 0 {
+		return fmt.Sprintf("no memories found for %q", query)
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("%d memory result(s) for %q:\n", len(results), query))
+	for _, obs := range results {
+		body := obs.Content
+		if len(body) > 140 {
+			body = body[:137] + "…"
+		}
+		sb.WriteString(fmt.Sprintf("  #%d [%s] %s\n    %s\n", obs.ID, obs.Type, obs.Title, body))
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+// handleForget soft-deletes an observation by ID and returns a status string.
+func (m *ChatModel) handleForget(idStr string) string {
+	if m.mem == nil {
+		return "memory not available (engram not loaded)"
+	}
+	id, err := strconv.ParseInt(strings.TrimSpace(idStr), 10, 64)
+	if err != nil {
+		return fmt.Sprintf("invalid id %q — usage: /forget <number>", idStr)
+	}
+	if err := m.mem.DeleteObservation(id, false); err != nil {
+		return "error deleting memory: " + err.Error()
+	}
+	if m.memCount > 0 {
+		m.memCount--
+	}
+	return fmt.Sprintf("✓ forgot memory #%d", id)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
