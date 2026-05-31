@@ -4,6 +4,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 
 	"github.com/BrainBreaking/mesh/internal/chat"
 )
@@ -84,18 +86,35 @@ type ChatModel struct {
 	cancel context.CancelFunc
 
 	// glamour markdown renderer (rebuilt on resize)
-	renderer  *glamour.TermRenderer
-	rendererW int // last width the renderer was built for
+	renderer    *glamour.TermRenderer
+	rendererW   int    // last width the renderer was built for
+	glamourStyle string // "dark" or "light", detected before Bubbletea starts
 }
 
 // ── RunChat ───────────────────────────────────────────────────────────────────
 
 // RunChat starts the TUI and blocks until the user quits.
 func RunChat(sess *chat.Session, backendID, backendType, modelName string, rulesCount int) error {
-	m := newChatModel(sess, backendID, backendType, modelName, rulesCount)
+	// Detect terminal background colour HERE, before tea.NewProgram() puts the
+	// terminal into raw mode.  glamour.WithAutoStyle() sends an OSC escape to
+	// query the background; if that query fires while Bubbletea owns stdin, the
+	// terminal's reply (e.g. "11;rgb:2828/2c2c/3434") is read as keyboard input
+	// and injected into the textarea as garbage text.
+	glamourStyle := probeGlamourStyle()
+
+	m := newChatModel(sess, backendID, backendType, modelName, rulesCount, glamourStyle)
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err := p.Run()
 	return err
+}
+
+// probeGlamourStyle queries the terminal background colour while stdin is still
+// in normal (cooked) mode and returns the matching glamour style name.
+func probeGlamourStyle() string {
+	if termenv.NewOutput(os.Stdout).HasDarkBackground() {
+		return "dark"
+	}
+	return "light"
 }
 
 // ── constructor ───────────────────────────────────────────────────────────────
@@ -104,6 +123,7 @@ func newChatModel(
 	sess *chat.Session,
 	backendID, backendType, modelName string,
 	rulesCount int,
+	glamourStyle string,
 ) ChatModel {
 	ta := textarea.New()
 	ta.Placeholder = "Type a message…  (shift+enter for newline)"
@@ -136,6 +156,7 @@ func newChatModel(
 		cancel:       cancel,
 		compIdx:      -1,
 		hasCommander: hasCommander,
+		glamourStyle: glamourStyle,
 	}
 }
 
@@ -379,7 +400,7 @@ func (m *ChatModel) rebuildRenderer() {
 		return
 	}
 	r, err := glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
+		glamour.WithStandardStyle(m.glamourStyle),
 		glamour.WithWordWrap(w),
 	)
 	if err == nil {
